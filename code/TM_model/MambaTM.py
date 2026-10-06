@@ -177,7 +177,7 @@ class Model(nn.Module):
         SW = math.ceil(W/8)
         h_curve = list(Hilbert3d(width=SW, height=SH, depth=T))
         h_curve = torch.tensor(h_curve).long().to(device)
-        self.h_curve = h_curve[:, 0] * SW * T + h_curve[:, 1] * T + h_curve[:, 2]
+        self.h_curve = h_curve[:, 1] * SW * T + h_curve[:, 0] * T + h_curve[:, 2]
         
     def forward(self, x):
         B, T, C, H, W = x.shape

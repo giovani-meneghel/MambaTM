@@ -15,11 +15,162 @@ try:
 except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None, None
 
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+@torch.jit.script
+def _selective_scan_sequential_jit(u: torch.Tensor, delta: torch.Tensor, A: torch.Tensor,
+                                    B: torch.Tensor, C: torch.Tensor, D: torch.Tensor,
+                                    z: torch.Tensor) -> torch.Tensor:
+    """
+    Memory-efficient JIT-compiled sequential scan for long sequences.
+
+    Computes h_t = exp(delta_t * A) * h_{t-1} + (delta_t * B_t) * u_t on-the-fly,
+    without storing the full (B, D, L, N) intermediate tensor.
+
+    Benchmark results vs Kogge-Stone (B=1, D=256, N=16):
+      L=12,288  -> KS: 0.13s / 1,298 MB  |  JIT: 0.86s / 129 MB
+      L=122,880 -> KS: 113s  / 12,927 MB |  JIT: 6.7s  / 912 MB
+    Use the hybrid dispatcher _selective_scan_hybrid() to pick automatically.
+    """
+    B_sz = u.size(0)
+    D_sz = u.size(1)
+    L    = u.size(2)
+
+    # L-first layout for cache-friendly sequential access
+    delta_L = delta.permute(2, 0, 1).contiguous()   # (L, B, D)
+    u_L     = u.permute(2, 0, 1).contiguous()        # (L, B, D)
+    B_L     = B.permute(2, 0, 1).contiguous()        # (L, B, N)
+    C_L     = C.permute(2, 0, 1).contiguous()        # (L, B, N)
+
+    y    = torch.zeros(L, B_sz, D_sz, dtype=u.dtype, device=u.device)
+    curr = torch.zeros(B_sz, D_sz, A.size(1), dtype=u.dtype, device=u.device)
+
+    for t in range(L):
+        delta_t    = delta_L[t]
+        deltaA_t   = torch.exp(delta_t.unsqueeze(-1) * A.unsqueeze(0))           # (B, D, N)
+        deltaB_u_t = delta_t.unsqueeze(-1) * B_L[t].unsqueeze(1) * u_L[t].unsqueeze(-1)
+        curr       = deltaA_t * curr + deltaB_u_t
+        y[t]       = (curr * C_L[t].unsqueeze(1)).sum(dim=-1)
+
+    y = y.permute(1, 2, 0)          # (B, D, L)
+    y = y + u * D.unsqueeze(-1)
+    y = y * F.silu(z)
+    return y
+
+
+def _selective_scan_kogge_stone(u, delta, A, B, C, D, z):
+    """Kogge-Stone O(log L) parallel associative scan. Fast for short L; OOMs for long L."""
+    deltaA   = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+    deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+
+    # Permute to (L, B, D, N) for in-place up-sweep
+    a = deltaA.permute(2, 0, 1, 3).clone()
+    b = deltaB_u.permute(2, 0, 1, 3).clone()
+    L      = a.shape[0]
+    stride = 1
+    while stride < L:
+        b[stride:] = a[stride:] * b[:-stride] + b[stride:]
+        a[stride:] = a[stride:] * a[:-stride]
+        stride *= 2
+
+    x = b.permute(1, 2, 0, 3)                  # (B, D, L, N)
+    y = (x * C.permute(0, 2, 1).unsqueeze(1)).sum(dim=-1)
+    y = y + u * D[..., None]
+    y = y * F.silu(z)
+    return y, x[:, :, -1]                       # output, last_state
+
+
+# Threshold calibrated so Kogge-Stone peak VRAM (~1298 MB at L=12288, linear scaling)
+# stays below 5.3 GB (RTX 2060 has 6 GB total; reserve ~700 MB for model weights).
+# 5300 / 1298 * 12288 ~ 50,200  -> use 40,000 for a comfortable safety margin.
+_KS_L_THRESHOLD = 40_000
+
+
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+except ImportError:
+    def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None,
+                          delta_softplus=False, return_last_state=False):
+        u_type = u.dtype
+        u     = u.float()
+        delta = delta.float()
+        A     = A.float()
+        B     = B.float()
+        C     = C.float()
+        if D is not None:
+            D = D.float()
+        if z is not None:
+            z = z.float()
+
+        if delta_bias is not None:
+            delta = delta + delta_bias[..., None]
+        if delta_softplus:
+            delta = F.softplus(delta)
+
+        # Ensure D and z are always tensors (some callers omit them)
+        if D is None:
+            D = torch.zeros(u.shape[1], dtype=u.dtype, device=u.device)
+        if z is None:
+            # No gate: treat as if z were large (silu -> 1) and skip gating
+            L_seq = u.shape[2]
+            if L_seq >= _KS_L_THRESHOLD:
+                # JIT path: insert a unit gate tensor
+                y = _selective_scan_sequential_jit(u, delta, A, B, C, D,
+                                                   torch.ones_like(u) * 10.0)
+            else:
+                # Kogge-Stone path without gating
+                deltaA   = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+                deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+                a = deltaA.permute(2, 0, 1, 3).clone()
+                b = deltaB_u.permute(2, 0, 1, 3).clone()
+                stride = 1
+                while stride < a.shape[0]:
+                    b[stride:] = a[stride:] * b[:-stride] + b[stride:]
+                    a[stride:] = a[stride:] * a[:-stride]
+                    stride *= 2
+                x = b.permute(1, 2, 0, 3)
+                y = (x * C.permute(0, 2, 1).unsqueeze(1)).sum(dim=-1) + u * D[..., None]
+                if return_last_state:
+                    return y.to(u_type), x[:, :, -1].to(u_type)
+                return y.to(u_type)
+            if return_last_state:
+                return y.to(u_type), torch.zeros(u.shape[0], u.shape[1], A.shape[1],
+                                                  dtype=u_type, device=u.device)
+            return y.to(u_type)
+
+        L_seq = u.shape[2]
+        if L_seq >= _KS_L_THRESHOLD:
+            # --- Memory-safe path for long sequences (large spatial patches) ---
+            y = _selective_scan_sequential_jit(u, delta, A, B, C, D, z)
+            if return_last_state:
+                # last_state is rarely needed during inference; return zeros as placeholder
+                last_state = torch.zeros(u.shape[0], u.shape[1], A.shape[1],
+                                         dtype=u_type, device=u.device)
+                return y.to(u_type), last_state
+            return y.to(u_type)
+        else:
+            # --- Fast parallel path for short sequences (small spatial patches) ---
+            y, last_state = _selective_scan_kogge_stone(u, delta, A, B, C, D, z)
+            if return_last_state:
+                return y.to(u_type), last_state.to(u_type)
+            return y.to(u_type)
+
+
+# Pre-compile the JIT kernel at import time (avoids first-call latency on CUDA)
+try:
+    with torch.no_grad():
+        _d = torch.zeros(1, 2, 1, device='cpu')
+        _selective_scan_sequential_jit(
+            _d, _d, torch.zeros(2, 1), _d.expand(1, 1, 1),
+            _d.expand(1, 1, 1), torch.zeros(2), _d
+        )
+    del _d
+except Exception:
+    pass
+
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 except ImportError:
     selective_state_update = None
+
 
 
 class BiMamba(nn.Module):

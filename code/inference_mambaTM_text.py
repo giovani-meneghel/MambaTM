@@ -1,6 +1,8 @@
 import argparse
 from PIL import Image
 import os
+import sys
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 import cv2
 import numpy as np
 import torch

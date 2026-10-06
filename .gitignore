@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+videos/*_restored*.mp4
+.DS_Store
+Thumbs.db

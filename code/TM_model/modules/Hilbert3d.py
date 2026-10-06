@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
-# Copyright (c) 2018 Jakub Červený
+# Copyright (c) 2018 Jakub Cerveny
 # https://github.com/jakubcerveny/gilbert
 
 
